@@ -3,8 +3,9 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,15 @@ const SERIAL_DEFAULT_TIMEOUT_MS: u64 = 2500;
 /// Max wait for the **first** UART line after `AT+TEST=RXLRPKT` (idle between SSDV bursts).
 const LORA_PACKET_WAIT_SECS: u64 = 60;
 /// After the first UART line in a session, wait this long for each following line before re-arming
-/// with `RXLRPKT`. Must exceed `SSDV_INTER_PACKET_MS` on TX + UART margin (hiccups, host load).
-const RX_BURST_LINE_TIMEOUT_MS: u64 = 500;
+/// with `RXLRPKT`. Must cover LoRa packet airtime + E5 UART jitter + host scheduling (Windows).
+const RX_BURST_LINE_TIMEOUT_MS: u64 = 3000;
+/// Packet-count-only UI tick when live preview decode is skipped or throttled.
+const PARTIAL_UI_EVERY: usize = 8;
+/// Try live SSDV→JPEG preview every N packets (plus first), gated by `PREVIEW_MIN_GAP_MS`.
+const PREVIEW_EVERY: usize = 10;
+const PREVIEW_MIN_GAP_MS: u64 = 120;
+/// `BufReader` capacity on the serial port (shown in UI).
+pub const SERIAL_READER_CAP_BYTES: usize = 128 * 1024;
 /// Wall time budget to drain trailing UART lines before the next RXLRPKT.
 const SLURP_TRAILING_CAP_MS: u64 = 500;
 /// Per-read timeout inside slurp (ms).
@@ -56,8 +64,13 @@ pub enum Event {
     Jpeg(JpegUpdate),
 }
 
-fn log(tx: &Sender<Event>, s: impl Into<String>) {
-    let _ = tx.send(Event::Log(s.into()));
+fn emit(tx: &Sender<Event>, q: &AtomicUsize, ev: Event) {
+    q.fetch_add(1, Ordering::Relaxed);
+    let _ = tx.send(ev);
+}
+
+fn log(tx: &Sender<Event>, q: &AtomicUsize, s: impl Into<String>) {
+    emit(tx, q, Event::Log(s.into()));
 }
 
 pub fn run_worker(
@@ -65,13 +78,15 @@ pub fn run_worker(
     baud: u32,
     rf: RfConfig,
     tx: Sender<Event>,
-    running: std::sync::Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
     debug_timing: bool,
+    ui_queue_depth: Arc<AtomicUsize>,
 ) {
-    if let Err(e) = run_inner(&port_name, baud, rf, &tx, &running, debug_timing) {
-        log(&tx, format!("ERROR: {e:#}"));
+    let q = ui_queue_depth.as_ref();
+    if let Err(e) = run_inner(&port_name, baud, rf, &tx, &running, debug_timing, q) {
+        log(&tx, q, format!("ERROR: {e:#}"));
     }
-    log(&tx, "--- disconnected ---");
+    log(&tx, q, "--- disconnected ---");
 }
 
 fn run_inner(
@@ -79,14 +94,18 @@ fn run_inner(
     baud: u32,
     rf: RfConfig,
     tx: &Sender<Event>,
-    running: &std::sync::Arc<AtomicBool>,
+    running: &Arc<AtomicBool>,
     debug: bool,
+    q: &AtomicUsize,
 ) -> Result<()> {
     const SSDV_PKT: i32 = 255;
     let mut ssdv_stash: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
     // Last SSDV image_id in stash; clear stash when it changes (new picture).
     let mut ssdv_stash_image_id: Option<u8> = None;
     let mut preview_work = vec![0u8; 1024 * 1024];
+    let mut last_live_preview = Instant::now()
+        .checked_sub(Duration::from_millis(500))
+        .unwrap_or_else(Instant::now);
     if !(7..=12).contains(&rf.sf) {
         anyhow::bail!("SF must be 7..=12");
     }
@@ -103,9 +122,10 @@ fn run_inner(
         .open()
         .with_context(|| format!("open serial port {port_name}"))?;
 
-    log(tx, format!("Opened {port_name} @ {baud} baud"));
+    log(tx, q, format!("Opened {port_name} @ {baud} baud"));
     log(
         tx,
+        q,
         format!(
             "RF: {} MHz SF{} BW{} (match ESP32 / LORA_* env on old CLI)",
             rf.freq_mhz, rf.sf, rf.bw
@@ -114,14 +134,15 @@ fn run_inner(
 
     let _ = drain_reader(port.as_mut(), Duration::from_millis(50));
 
-    if let Err(e) = expect_contains(port.as_mut(), "AT\r\n", "+AT: OK", "AT", tx) {
+    if let Err(e) = expect_contains(port.as_mut(), "AT\r\n", "+AT: OK", "AT", tx, q) {
         if baud == 115200 {
             log(
                 tx,
+                q,
                 "No AT at 115200, trying bootstrap at 9600 -> set UART 115200...",
             );
             drop(port);
-            bootstrap_uart_115200(port_name, tx)?;
+            bootstrap_uart_115200(port_name, tx, q)?;
             port = serialport::new(port_name, 115200)
                 .timeout(Duration::from_millis(SERIAL_DEFAULT_TIMEOUT_MS))
                 .data_bits(serialport::DataBits::Eight)
@@ -131,13 +152,20 @@ fn run_inner(
                 .open()
                 .with_context(|| format!("re-open serial port {port_name} @115200"))?;
             let _ = drain_reader(port.as_mut(), Duration::from_millis(100));
-            expect_contains(port.as_mut(), "AT\r\n", "+AT: OK", "AT(115200)", tx)?;
-            log(tx, "UART now active at 115200");
+            expect_contains(port.as_mut(), "AT\r\n", "+AT: OK", "AT(115200)", tx, q)?;
+            log(tx, q, "UART now active at 115200");
         } else {
             return Err(e);
         }
     }
-    expect_contains(port.as_mut(), "AT+MODE=TEST\r\n", "+MODE: TEST", "AT+MODE=TEST", tx)?;
+    expect_contains(
+        port.as_mut(),
+        "AT+MODE=TEST\r\n",
+        "+MODE: TEST",
+        "AT+MODE=TEST",
+        tx,
+        q,
+    )?;
 
     let sf_str = format!("SF{}", rf.sf);
     let rfcfg = format!(
@@ -146,19 +174,18 @@ fn run_inner(
         sf_str,
         rf.bw
     );
-    expect_contains(port.as_mut(), &rfcfg, "+TEST: RFCFG", "AT+TEST=RFCFG", tx)?;
+    expect_contains(port.as_mut(), &rfcfg, "+TEST: RFCFG", "AT+TEST=RFCFG", tx, q)?;
 
-    log(tx, "Listening… (Disconnect to stop.)");
+    log(tx, q, "Listening… (Disconnect to stop.)");
     if debug {
         log(
             tx,
+            q,
             "[DBG] One AT+TEST=RXLRPKT per burst; then read many +TEST: RX lines until UART idle",
         );
     }
 
-    // One BufReader for the whole listen loop. Recreating it every packet discarded buffered
-    // UART bytes (trailing OK / prompts), which desynced AT parsing and looked like missing SSDV packets.
-    let mut reader = BufReader::new(port);
+    let mut reader = BufReader::with_capacity(SERIAL_READER_CAP_BYTES, port);
 
     let mut session: u64 = 0;
     let mut pkt_seq: u64 = 0;
@@ -171,12 +198,15 @@ fn run_inner(
         )?;
 
         if debug {
-            log(tx, format!("[DBG] session#{session} → AT+TEST=RXLRPKT (one arm for many packets)"));
+            log(
+                tx,
+                q,
+                format!("[DBG] session#{session} → AT+TEST=RXLRPKT (one arm for many packets)"),
+            );
         }
         let t_session = Instant::now();
         write_all_cmd(reader.get_mut().as_mut(), "AT+TEST=RXLRPKT\r\n")?;
 
-        let mut meta: Option<String> = None;
         let mut first_line = true;
         // Long wait until first UART line; shorter waits between following lines in this session.
         let mut line_timeout = Duration::from_secs(LORA_PACKET_WAIT_SECS);
@@ -199,13 +229,14 @@ fn run_inner(
                         if debug {
                             log(
                                 tx,
+                                q,
                                 format!(
                                     "[DBG] session#{session} UART idle after {:?} → new RXLRPKT next",
                                     t_session.elapsed()
                                 ),
                             );
                         } else {
-                            log(tx, "(RX burst idle, RXLRPKT)".to_string());
+                            log(tx, q, "(RX burst idle, RXLRPKT)".to_string());
                         }
                         break;
                     }
@@ -223,6 +254,7 @@ fn run_inner(
             if debug && first_line {
                 log(
                     tx,
+                    q,
                     format!(
                         "[DBG] session#{session} first line +{:?}: {}",
                         t_session.elapsed(),
@@ -230,14 +262,20 @@ fn run_inner(
                     ),
                 );
                 first_line = false;
+            } else if first_line {
+                first_line = false;
             }
-            log(tx, t.to_string());
+
+            let payload_hex = extract_lora_hex_payload(t);
+            if debug || payload_hex.is_none() {
+                log(tx, q, t.to_string());
+            }
 
             if let Some(rest) = t.strip_prefix("+TEST: LEN:") {
-                meta = Some(rest.to_string());
                 if debug {
                     log(
                         tx,
+                        q,
                         format!(
                             "[DBG] session#{session} meta +{:?}: LEN line ({})",
                             t_session.elapsed(),
@@ -247,25 +285,26 @@ fn run_inner(
                 }
             }
 
-            if let Some(hex_part) = extract_lora_hex_payload(t) {
+            if let Some(hex_part) = payload_hex {
                 match decode_hex(&hex_part) {
                     Ok(bytes) => {
                         pkt_seq += 1;
-                        let air_hdr: String = bytes
-                            .iter()
-                            .take(4)
-                            .map(|b| format!("{b:02X}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let preview: String = bytes
-                            .iter()
-                            .take(12)
-                            .map(|b| format!("{b:02X}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
                         if debug {
+                            let air_hdr: String = bytes
+                                .iter()
+                                .take(4)
+                                .map(|b| format!("{b:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let preview: String = bytes
+                                .iter()
+                                .take(12)
+                                .map(|b| format!("{b:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             log(
                                 tx,
+                                q,
                                 format!(
                                     "[DBG] PKT#{pkt_seq} session#{session} LoRa {} B, air[0..4]={air_hdr} (NOFEC ~55 67, NORMAL ~55 66) | first12: {} … (+{:?})",
                                     bytes.len(),
@@ -273,14 +312,6 @@ fn run_inner(
                                     t_session.elapsed()
                                 ),
                             );
-                        }
-                        if !debug {
-                            let lossy = String::from_utf8_lossy(&bytes);
-                            if let Some(m) = &meta {
-                                log(tx, format!(">>> payload ({m}): {lossy:?}"));
-                            } else {
-                                log(tx, format!(">>> payload: {lossy:?}"));
-                            }
                         }
                         if packet_ok(&bytes, SSDV_PKT) {
                             let image_id = bytes[6];
@@ -295,6 +326,9 @@ fn run_inner(
                                 Some(prev) if prev != image_id => {
                                     ssdv_stash.clear();
                                     ssdv_stash_image_id = Some(image_id);
+                                    last_live_preview = Instant::now()
+                                        .checked_sub(Duration::from_millis(400))
+                                        .unwrap_or_else(Instant::now);
                                 }
                                 _ => {}
                             }
@@ -306,81 +340,149 @@ fn run_inner(
                                 .collect();
 
                             if ordered.is_empty() {
-                                log(
-                                    tx,
-                                    format!(
-                                        "SSDV pkt image={} packet={} eoi={} (stash empty after insert?)",
-                                        image_id, packet_id, eoi
-                                    ),
-                                );
+                                if debug {
+                                    log(
+                                        tx,
+                                        q,
+                                        format!(
+                                            "SSDV pkt image={} packet={} eoi={} (stash empty after insert?)",
+                                            image_id, packet_id, eoi
+                                        ),
+                                    );
+                                }
                             } else {
                                 let first_pid =
                                     u16::from_be_bytes([ordered[0][7], ordered[0][8]]);
                                 if first_pid != 0 {
-                                    log(
-                                        tx,
-                                        format!(
-                                            "SSDV pkt image={} packet={} eoi={} (waiting for packet 0; stash has {} pkts)",
-                                            image_id, packet_id, eoi, ordered.len()
-                                        ),
-                                    );
-                                } else {
-                                let slices: Vec<&[u8]> =
-                                    ordered.iter().map(|v| v.as_slice()).collect();
-                                match preview_replay_ordered(&slices, SSDV_PKT, &mut preview_work) {
-                                    Ok(Some(mut jpeg)) => {
-                                        if debug {
-                                            log(
+                                    if debug {
+                                        log(
+                                            tx,
+                                            q,
+                                            format!(
+                                                "SSDV pkt image={} packet={} eoi={} (waiting for packet 0; stash has {} pkts)",
+                                                image_id, packet_id, eoi, ordered.len()
+                                            ),
+                                        );
+                                    }
+                                } else if eoi {
+                                    let slices: Vec<&[u8]> =
+                                        ordered.iter().map(|v| v.as_slice()).collect();
+                                    match preview_replay_ordered(&slices, SSDV_PKT, &mut preview_work)
+                                    {
+                                        Ok(Some(mut jpeg)) => {
+                                            if debug {
+                                                log(
+                                                    tx,
+                                                    q,
+                                                    format!(
+                                                        "SSDV EOI image={} pkt={} | {} pkts → {} B JPEG",
+                                                        image_id,
+                                                        packet_id,
+                                                        ordered.len(),
+                                                        jpeg.len()
+                                                    ),
+                                                );
+                                            }
+                                            let frame = jpeg_bytes_to_rgba(&jpeg).ok();
+                                            if frame.is_none() {
+                                                log(
+                                                    tx,
+                                                    q,
+                                                    format!(
+                                                        "SSDV RGBA decode failed (image={} pkt={}); JPEG file still saved",
+                                                        image_id, packet_id
+                                                    ),
+                                                );
+                                            }
+                                            let jpeg_for_save = std::mem::take(&mut jpeg);
+                                            emit(
                                                 tx,
-                                                format!(
-                                                    "SSDV pkt image={} packet={} eoi={} | preview {} pkts (gaps ok), {} B JPEG",
+                                                q,
+                                                Event::Jpeg(JpegUpdate {
+                                                    frame,
+                                                    jpeg_for_save,
+                                                    packets: ordered.len(),
+                                                    complete: true,
                                                     image_id,
-                                                    packet_id,
-                                                    eoi,
-                                                    ordered.len(),
-                                                    jpeg.len()
-                                                ),
+                                                }),
                                             );
                                         }
-                                        let frame = jpeg_bytes_to_rgba(&jpeg).ok();
-                                        if frame.is_none() && eoi {
-                                            log(
-                                                tx,
-                                                format!(
-                                                    "SSDV RGBA decode failed (image={} pkt={}); full JPEG still saved",
-                                                    image_id, packet_id
-                                                ),
-                                            );
+                                        Ok(None) => {
+                                            if debug {
+                                                log(
+                                                    tx,
+                                                    q,
+                                                    format!(
+                                                        "SSDV EOI image={} pkt={} (preview replay skipped)",
+                                                        image_id, packet_id
+                                                    ),
+                                                );
+                                            }
                                         }
-                                        let jpeg_for_save = if eoi {
-                                            std::mem::take(&mut jpeg)
-                                        } else {
-                                            Vec::new()
-                                        };
-                                        let _ = tx.send(Event::Jpeg(JpegUpdate {
-                                            frame,
-                                            jpeg_for_save,
-                                            packets: ordered.len(),
-                                            complete: eoi,
-                                            image_id,
-                                        }));
+                                        Err(e) => {
+                                            log(tx, q, format!("SSDV preview replay error: {e:#}"))
+                                        }
                                     }
-                                    Ok(None) => log(
-                                        tx,
-                                        format!(
-                                            "SSDV pkt image={} packet={} eoi={} (preview replay skipped)",
-                                            image_id, packet_id, eoi
-                                        ),
-                                    ),
-                                    Err(e) => {
-                                        log(tx, format!("SSDV preview replay error: {e:#}"))
+                                } else {
+                                    let min_gap = Duration::from_millis(PREVIEW_MIN_GAP_MS);
+                                    let want_preview = ordered.len() == 1
+                                        || (ordered.len() % PREVIEW_EVERY == 0);
+                                    let mut sent_frame = false;
+                                    if want_preview && last_live_preview.elapsed() >= min_gap {
+                                        let slices: Vec<&[u8]> =
+                                            ordered.iter().map(|v| v.as_slice()).collect();
+                                        match preview_replay_ordered(
+                                            &slices,
+                                            SSDV_PKT,
+                                            &mut preview_work,
+                                        ) {
+                                            Ok(Some(jpeg)) => {
+                                                last_live_preview = Instant::now();
+                                                let frame = jpeg_bytes_to_rgba(&jpeg).ok();
+                                                emit(
+                                                    tx,
+                                                    q,
+                                                    Event::Jpeg(JpegUpdate {
+                                                        frame,
+                                                        jpeg_for_save: Vec::new(),
+                                                        packets: ordered.len(),
+                                                        complete: false,
+                                                        image_id,
+                                                    }),
+                                                );
+                                                sent_frame = true;
+                                            }
+                                            Ok(None) | Err(_) => {}
+                                        }
                                     }
-                                }
+                                    if !sent_frame
+                                        && (ordered.len() == 1
+                                            || (ordered.len() % PARTIAL_UI_EVERY == 0))
+                                    {
+                                        emit(
+                                            tx,
+                                            q,
+                                            Event::Jpeg(JpegUpdate {
+                                                frame: None,
+                                                jpeg_for_save: Vec::new(),
+                                                packets: ordered.len(),
+                                                complete: false,
+                                                image_id,
+                                            }),
+                                        );
+                                    }
                                 }
                             }
                         } else if debug {
+                            let air_hdr: String = bytes
+                                .iter()
+                                .take(4)
+                                .map(|b| format!("{b:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             log(
                                 tx,
+                                q,
                                 format!(
                                     "[DBG] PKT#{pkt_seq} session#{session} not valid SSDV (sync/type/CRC/FEC); air[0..4]={air_hdr} (+{:?})",
                                     t_session.elapsed()
@@ -388,18 +490,18 @@ fn run_inner(
                             );
                         }
                     }
-                    Err(e) => log(tx, format!(">>> bad hex: {e}")),
+                    Err(e) => log(tx, q, format!(">>> bad hex: {e}")),
                 }
                 if debug {
                     log(
                         tx,
+                        q,
                         format!(
                             "[DBG] PKT#{pkt_seq} session#{session} line done in {:?}",
                             t_session.elapsed()
                         ),
                     );
                 }
-                meta = None;
                 continue;
             }
 
@@ -440,7 +542,7 @@ fn slurp_trailing_lines(
     res
 }
 
-fn bootstrap_uart_115200(port_name: &str, tx: &Sender<Event>) -> Result<()> {
+fn bootstrap_uart_115200(port_name: &str, tx: &Sender<Event>, q: &AtomicUsize) -> Result<()> {
     let mut p = serialport::new(port_name, 9600)
         .timeout(Duration::from_millis(SERIAL_DEFAULT_TIMEOUT_MS))
         .data_bits(serialport::DataBits::Eight)
@@ -451,7 +553,7 @@ fn bootstrap_uart_115200(port_name: &str, tx: &Sender<Event>) -> Result<()> {
         .with_context(|| format!("open serial port {port_name} @9600 for bootstrap"))?;
 
     let _ = drain_reader(p.as_mut(), Duration::from_millis(80));
-    expect_contains(p.as_mut(), "AT\r\n", "+AT: OK", "AT(9600 bootstrap)", tx)?;
+    expect_contains(p.as_mut(), "AT\r\n", "+AT: OK", "AT(9600 bootstrap)", tx, q)?;
     // LoRa-E5 applies UART baud after reset.
     expect_contains(
         p.as_mut(),
@@ -459,6 +561,7 @@ fn bootstrap_uart_115200(port_name: &str, tx: &Sender<Event>) -> Result<()> {
         "+UART",
         "AT+UART=BR,115200",
         tx,
+        q,
     )?;
     // Best effort reset. If unsupported, user can power-cycle manually.
     let _ = write_all_cmd(p.as_mut(), "AT+RESET\r\n");
@@ -507,6 +610,7 @@ fn expect_contains(
     needle: &str,
     label: &str,
     tx: &Sender<Event>,
+    q: &AtomicUsize,
 ) -> Result<()> {
     write_all_cmd(port, cmd)?;
     port.set_timeout(Duration::from_secs(AT_LINE_TIMEOUT_SECS))?;
@@ -521,7 +625,7 @@ fn expect_contains(
             Ok(_) => {
                 let t = line.trim_end();
                 if !t.is_empty() {
-                    log(tx, t.to_string());
+                    log(tx, q, t.to_string());
                 }
                 acc.push_str(&line);
                 if acc.contains(needle) {

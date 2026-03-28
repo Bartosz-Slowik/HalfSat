@@ -31,9 +31,11 @@ static constexpr uint16_t PREAMBLE_LEN = 8;
 static constexpr float TCXO_VOLTAGE = 1.8F;
 
 static constexpr int SSDV_AIR_PKTLEN = 255;
-static constexpr uint32_t SSDV_INTER_PACKET_MS = 1;
+/** Extra delay after each LoRa TX; E5 UART / receiver need margin vs bare airtime. */
+static constexpr uint32_t SSDV_INTER_PACKET_MS = 8;
 static constexpr int8_t SSDV_QUALITY = 6;
-static constexpr uint32_t AFTER_IMAGE_GAP_MS = 5000;
+/** Silence between images so the E5+host can finish SSDV before the next image_id. */
+static constexpr uint32_t AFTER_IMAGE_GAP_MS = 20000;
 static char SSDV_CALLSIGN[] = "HABSAT";
 
 static Module radioModule(PIN_CS, PIN_IRQ_DIO1, PIN_RST, PIN_BUSY, SPI,
@@ -77,6 +79,8 @@ static bool sendSsdvImage(const uint8_t *jpeg, size_t jpeg_len, uint8_t image_id
       haltOnFail(st, "radio.transmit");
       delay(SSDV_INTER_PACKET_MS);
     } else if (r == SSDV_EOI) {
+      Serial.printf("[tx] image #%u sent, %u SSDV packets\n", (unsigned)image_id,
+                    (unsigned)pkt_count);
       return true;
     } else if (r == SSDV_FEED_ME) {
       Serial.println("ssdv: unexpected FEED_ME (truncated JPEG?)");

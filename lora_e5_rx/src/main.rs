@@ -2,16 +2,16 @@
 //!
 //! Optional CLI: `lora_e5_rx COM5` pre-fills the port field.
 //!
-//! Each **complete** SSDV image is saved under `./ssdv_received/`. The right panel refreshes as
-//! packets arrive (JPEG is decoded on the serial worker thread so the UI stays responsive).
+//! Each **complete** SSDV image is saved under `./ssdv_received/`. Throttled live preview while
+//! receiving; toolbar shows serial read buffer size and approximate UI event queue depth.
 
 mod radio;
 mod ssdv_native;
 
 use eframe::egui;
-use radio::{Event, JpegUpdate, RfConfig, run_worker};
+use radio::{Event, JpegUpdate, RfConfig, run_worker, SERIAL_READER_CAP_BYTES};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -66,11 +66,14 @@ struct LoraApp {
     info_latest: String,
     /// SSDV `image_id` from last `JpegUpdate` (promote Last when this changes).
     last_rx_image_id: Option<u8>,
+    /// Worker increments per `Event` sent; UI subtracts per drained batch (backlog estimate).
+    ui_queue_depth: Arc<AtomicUsize>,
 }
 
 impl LoraApp {
     fn new(_cc: &eframe::CreationContext<'_>, prefill_port: Option<String>) -> Self {
         let (log_tx, log_rx) = mpsc::channel();
+        let ui_queue_depth = Arc::new(AtomicUsize::new(0));
         Self {
             port: prefill_port.unwrap_or_default(),
             baud: "115200".into(),
@@ -83,7 +86,7 @@ impl LoraApp {
             log_tx,
             running: Arc::new(AtomicBool::new(false)),
             worker: None,
-            debug_timing: true,
+            debug_timing: false,
             jpeg_previous: None,
             jpeg_latest: None,
             tex_previous: None,
@@ -91,6 +94,7 @@ impl LoraApp {
             info_previous: "—".into(),
             info_latest: "No image yet".into(),
             last_rx_image_id: None,
+            ui_queue_depth,
         }
     }
 
@@ -103,6 +107,7 @@ impl LoraApp {
         if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
+        self.ui_queue_depth.store(0, Ordering::Relaxed);
     }
 
     fn connect(&mut self) -> Result<(), String> {
@@ -143,11 +148,12 @@ impl LoraApp {
         self.running.store(true, Ordering::SeqCst);
         let run = self.running.clone();
         let tx = self.log_tx.clone();
+        let qd = self.ui_queue_depth.clone();
         let port_clone = port.clone();
         let dbg = self.debug_timing;
 
         let h = std::thread::spawn(move || {
-            run_worker(port_clone, baud, rf, tx, run, dbg);
+            run_worker(port_clone, baud, rf, tx, run, dbg, qd);
         });
         self.worker = Some(h);
         self.last_rx_image_id = None;
@@ -156,17 +162,19 @@ impl LoraApp {
     }
 
     fn drain_log(&mut self, ctx: &egui::Context) {
-        let pending: Vec<Event> = self.log_rx.try_iter().collect();
-        if pending.is_empty() {
-            return;
-        }
-        for ev in pending {
+        const MAX_EVENTS_PER_FRAME: usize = 8192;
+        let batch: Vec<Event> = self.log_rx.try_iter().take(MAX_EVENTS_PER_FRAME).collect();
+        let n = batch.len();
+        for ev in batch {
             match ev {
                 Event::Log(line) => self.push_lora_log(line),
                 Event::Jpeg(j) => self.apply_jpeg(ctx, j),
             }
         }
-        ctx.request_repaint();
+        if n > 0 {
+            self.ui_queue_depth.fetch_sub(n, Ordering::Relaxed);
+            ctx.request_repaint();
+        }
     }
 
     fn jpeg_to_color(jpeg_bytes: &[u8]) -> Result<(egui::ColorImage, [usize; 2]), image::ImageError> {
@@ -348,6 +356,15 @@ impl eframe::App for LoraApp {
                     self.lora_msg_prev = "—".into();
                     self.lora_msg_latest = "—".into();
                 }
+                let q = self.ui_queue_depth.load(Ordering::Relaxed);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Serial buf {} KiB · UI queue ~{q}",
+                        SERIAL_READER_CAP_BYTES / 1024
+                    ))
+                    .small()
+                    .weak(),
+                );
                 ui.label(egui::RichText::new(format!("Saves → ./{SAVE_DIR}/")).small().weak());
             });
         });
@@ -415,8 +432,8 @@ impl eframe::App for LoraApp {
         });
 
         if self.worker.is_some() {
-            // Poll serial channel without forcing max frame rate (reduces full-window flicker).
-            ctx.request_repaint_after(Duration::from_millis(100));
+            // Worker can push events faster than vsync; repaint soon so the channel stays near empty.
+            ctx.request_repaint_after(Duration::from_millis(4));
         }
     }
 
