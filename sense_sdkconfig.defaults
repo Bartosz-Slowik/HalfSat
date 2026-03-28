@@ -1,0 +1,2 @@
+# uart_best: long SVGA JPEG software decode can block > default TWDT (5s) without idle feeding WDT.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30

@@ -1,0 +1,11 @@
+{
+  "name": "ssdv",
+  "version": "1.0.0",
+  "description": "fsphil/ssdv encoder (embedded)",
+  "license": "GPL-3.0",
+  "frameworks": "arduino",
+  "platforms": "*",
+  "build": {
+    "includeDir": "."
+  }
+}
